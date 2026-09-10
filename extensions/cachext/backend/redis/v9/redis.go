@@ -10,7 +10,6 @@ import (
 	"github.com/redis/go-redis/extra/redisotel/v9"
 	"github.com/redis/go-redis/v9"
 	"github.com/spf13/viper"
-	"go.opentelemetry.io/otel"
 
 	"github.com/shanbay/gobay"
 	"github.com/shanbay/gobay/extensions/cachext"
@@ -112,7 +111,9 @@ func (b *redisBackend) Init(config *viper.Viper) error {
 	redisClient := redis.NewClient(&opt)
 	b.client = redisClient
 	if observability.GetOtelEnable() {
-		tp := otel.GetTracerProvider()
+		// 官方 redisotel 没有 SpanFilter，交给它全局 provider 会把无父级的命令记成孤儿 span，
+		// 换成只在有已采样父级时才开 span 的 provider（与 otelsql / redisotelv6 语义一致）
+		tp := observability.ChildOnlyTracerProvider()
 		if err := redisotel.InstrumentTracing(redisClient, redisotel.WithTracerProvider(tp)); err != nil {
 			return err
 		}

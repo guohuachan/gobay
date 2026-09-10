@@ -13,7 +13,6 @@ import (
 	"github.com/redis/go-redis/extra/redisotel/v9"
 	"github.com/redis/go-redis/v9"
 	"github.com/shanbay/gobay"
-	"go.opentelemetry.io/otel"
 )
 
 // RedisExt redis扩展，处理client的初始化工作
@@ -61,7 +60,9 @@ func (c *RedisExt) Init(app *gobay.Application) error {
 	c.prefix = config.GetString("prefix")
 	c.redisClient = redis.NewClient(&opt)
 	if observability.GetOtelEnable() {
-		tp := otel.GetTracerProvider()
+		// 官方 redisotel 没有 SpanFilter，交给它全局 provider 会把无父级的命令记成孤儿 span，
+		// 换成只在有已采样父级时才开 span 的 provider（与 otelsql / redisotelv6 语义一致）
+		tp := observability.ChildOnlyTracerProvider()
 		if err := redisotel.InstrumentTracing(c.redisClient, redisotel.WithTracerProvider(tp)); err != nil {
 			return err
 		}
