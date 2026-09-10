@@ -9,7 +9,10 @@ import (
 
 func GetEntUnaryMw(e *entext.EntExt) grpc.UnaryServerInterceptor {
 	return func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
-		resp, rpcerr := handler(ctx, req)
+		// 顺手把入站 traceparent 提取进 ctx：这是绝大多数服务已经在用的唯一 gobay gRPC 中间件，
+		// 在这里做一次，没显式装 gobay_grpc.UnaryServerTracingInterceptor 的存量服务升级即生效。
+		// 幂等，两边都装也没事。
+		resp, rpcerr := handler(gobay_grpc.ExtractTraceContext(ctx), req)
 		err := rpcerr
 		if e.IsNotFound != nil && err != nil && e.IsNotFound(rpcerr) {
 			err = gobay_grpc.NotFoundError
