@@ -10,6 +10,7 @@ import (
 	"syscall"
 
 	"github.com/shanbay/gobay"
+	gobay_grpc "github.com/shanbay/gobay/grpc"
 	grpc_middleware "github.com/grpc-ecosystem/go-grpc-middleware"
 	grpc_recovery "github.com/grpc-ecosystem/go-grpc-middleware/recovery"
 	grpc_prometheus "github.com/grpc-ecosystem/go-grpc-prometheus"
@@ -37,6 +38,8 @@ func Serve(app *gobay.Application) error {
 
 	// 构建 gprc server的参数，包括 连接超时、middleware 等等
 	unaryInterceptors := []grpc.UnaryServerInterceptor{
+		// 放最前面：把 sidecar 传进来的 traceparent 提取进 ctx，后面所有 DB / Redis span 才有父级
+		gobay_grpc.UnaryServerTracingInterceptor(),
 {{- if not $.SkipSentry }}
 		grpc_recovery.UnaryServerInterceptor(sentrygrpcmw.GetOption(myapp.Sentry)),
 {{- end }}
