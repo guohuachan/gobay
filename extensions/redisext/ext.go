@@ -11,6 +11,7 @@ import (
 	"github.com/go-redis/redis"
 	"github.com/shanbay/gobay"
 	"github.com/shanbay/gobay/observability"
+	"github.com/shanbay/gobay/observability/redisotelv6"
 	"go.elastic.co/apm/module/apmgoredis"
 )
 
@@ -22,9 +23,27 @@ type RedisExt struct {
 	redisclient    *redis.Client
 	apmable        bool
 	apmredisclient apmgoredis.Client
+	otelable       bool
 }
 
 var _ gobay.Extension = (*RedisExt)(nil)
+
+// go-redis 默认的 PoolSize 是 10*runtime.NumCPU()，NumCPU 读的是宿主机核数、不感知
+// 容器的 CPU limit，多核节点上的容器会拿到远超实际需要的池上限；redis 一变慢就会变成
+// 放大器：请求堆积 -> 建更多连接 -> redis 更慢。
+//
+// 三个超时同样重要：go-redis v6 的连接读写和排队都不接受 context，上游 ctx 到期之后
+// 连接仍会等满 ReadTimeout 才归还，排队中的再叠加 PoolTimeout。按 Little's Law，连接
+// 数需求等于请求速率乘以单请求耗时，压缩耗时比限制连接数更接近问题本源。
+//
+// 取值与 cachext 的 redis backend 保持一致。需要放宽的服务显式配置对应键覆盖，
+// <NS>poolsize 配 0 则回到 go-redis 自己的默认值。
+const (
+	defaultPoolSize    = 100
+	defaultReadTimeout = 200 * time.Millisecond
+	defaultPoolTimeout = 100 * time.Millisecond
+	defaultIdleTimeout = 2 * time.Minute
+)
 
 func (c *RedisExt) Init(app *gobay.Application) error {
 	if c.NS == "" {
@@ -32,6 +51,12 @@ func (c *RedisExt) Init(app *gobay.Application) error {
 	}
 	c.app = app
 	config := gobay.GetConfigByPrefix(app.Config(), c.NS, true)
+	// 先补齐下划线写法（<NS>pool_size），否则会被 mapstructure 静默忽略
+	gobay.NormalizeUnderscoreKeys(config)
+	config.SetDefault("poolsize", defaultPoolSize)
+	config.SetDefault("readtimeout", defaultReadTimeout)
+	config.SetDefault("pooltimeout", defaultPoolTimeout)
+	config.SetDefault("idletimeout", defaultIdleTimeout)
 	opt := redis.Options{}
 	if err := config.Unmarshal(&opt); err != nil {
 		return err
@@ -42,6 +67,7 @@ func (c *RedisExt) Init(app *gobay.Application) error {
 		c.apmable = true
 		c.apmredisclient = apmgoredis.Wrap(c.redisclient)
 	}
+	c.otelable = observability.GetOtelEnable()
 	_, err := c.redisclient.Ping().Result()
 	return err
 }
@@ -96,10 +122,18 @@ func (c *RedisExt) Application() *gobay.Application {
 }
 
 func (c *RedisExt) Client(ctx context.Context) *redis.Client {
+	// apmgoredis 与 redisotelv6 都只作用于 WithContext 返回的每请求副本，
+	// 因此可以叠加：APM 与 OTel 各自产出 span，而不是二选一。
+	var client *redis.Client
 	if c.apmable {
-		return c.apmredisclient.WithContext(ctx).RedisClient()
+		client = c.apmredisclient.WithContext(ctx).RedisClient()
+	} else {
+		client = c.redisclient.WithContext(ctx)
 	}
-	return c.redisclient.WithContext(ctx)
+	if c.otelable {
+		client = redisotelv6.WrapClient(ctx, client)
+	}
+	return client
 }
 
 func (c *RedisExt) EvalLua(ctx context.Context, script string, keys []string, args ...any) (any, error) {

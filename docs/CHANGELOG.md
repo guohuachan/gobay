@@ -1,3 +1,70 @@
+# 1.2.13 (2026-09-15)
+
+- **行为变更：`asynctaskext` 的 `/health` 从「投递一条任务、等它被执行完」改为「读消费循环的心跳」**。旧实现的健康检查是一次端到端任务往返，要和真实任务抢同一个 worker 池——槽位耗尽时派发循环阻塞在 `<-pool`，健康检查任务被饿死，于是**队列一积压 worker 就被 liveness 探针杀掉，恰好在它最忙的时候**；杀掉又让在途任务重新入队，下一轮积压更重。**积压越重、被杀得越频繁**：线上有服务因此在 30 天内重启 215 次，重启窗口与队列长度逐点同步，而同期内存仅占 limit 的 10%、CPU 0.4%，与资源无关
+- 新判定：**心跳新鲜 → 健康；心跳停止但已满载 → 健康；心跳停止且仍有空闲槽位 → 不健康**。心跳由 `SetPreConsumeHandler` 在 machinery 拉取循环每轮迭代写入，空闲时约 1 次/秒。阈值 60s 的量纲是 BLPOP 轮询周期（中间件常量），与业务任务时长无关，**无需各服务校准，也不会因为任务跑得久而杀 worker**
+- 探针路径与返回码不变（`/health`，200 / 400），`timeout` 与 `queue` 两个 query 参数仍被接收（`timeout` 不再参与判定，`queue` 的作用域语义不变），**helm values 零改动，业务方只需升版本**。此前为绕过该缺陷而设置 `disableHealthCheck: true` 的服务（最早可追溯到 2023 年）可以重新打开探针
+- 删除 unexported 的 `checkHealth` / `registerHealthCheck` / `healthCheckCompleteChan` 及健康检查任务注册，业务方无感知
+- **新旧行为对比**（实测）：
+
+  | 场景 | 旧版 | 新版 |
+  | --- | --- | --- |
+  | 空闲 | 200 | 200 |
+  | **worker 正常忙（槽位占满）** | **400，被杀** | **200** |
+  | 槽位被死锁任务占满 | 400 | 200（与「忙」不可区分，选择不杀） |
+  | **broker 挂住** | **400，被杀** | **200** |
+  | 拉取循环退出但进程存活 | panic / 连接重置 | 400 |
+
+⚠️ 旧版只要「槽位占满」或「broker 不可达」就判不健康，**无法区分 worker 是在忙还是真卡死**，前者即为误杀来源。新版有意放弃对这两类的检出：死锁判为满载不杀，broker 故障不杀（重启 worker 救不了 broker）。**这两类应由「队列积压且该 worker 零产出」的告警覆盖。** 另：仅适用 redis broker，amqp broker 不调用 `PreConsumeHandler`。
+
+# 1.2.12 (2026-09-11)
+
+- **行为变更：`redisext` v9 与 `cachext` 的 redis v9 backend 的 OTel 插桩，只在 ctx 里带有「有效且已采样」的父级 span 时才产生 span**。此前 go-redis 官方 `redisotel` 没有 SpanFilter，ctx 没有父级（k8s 探针里的 `CheckHealth`、没有提取 traceparent 的 gRPC handler）时照样开根 span，被全局 provider 默认的 `ParentBased(AlwaysSample)` 100% 记录并发送——每条 Redis 命令都成了一条独立的孤儿 trace，完全绕过 istio 的头采样。线上 permission / lune 各约 5~8 万条/天，其中约 2/3 来自探针
+- 新增 `observability.ChildOnlyTracerProvider()`：ctx 无有效已采样父级 → 返回 non-recording span；有 → 转交全局 provider（每次 `Start` 时取，扩展 `Init` 早于 `otel.SetTracerProvider` 也不受影响）。语义与 `entext` 的 otelsql SpanFilter、`observability/redisotelv6` 一致，v9 是此前唯一漏掉的
+- 全局 sampler 不变：请求的根 span 仍由 istio sidecar 产生，beat / cron 里用 `ContextWithOtel` 自建的根 span 也不受影响
+- 线上验证（#757 合并前已用其 head 上线）：permission / lune 孤儿 span 归零；quest（gRPC 入口装了 traceparent 提取拦截器）每天约 5.7 万条挂在请求下的 Redis span 原样保留
+
+⚠️ 升级后，**gRPC 入口没有把 traceparent 提取进 ctx 的服务，handler 里的 Redis 命令会从「孤儿 span」变成「无 span」**——那些孤儿本来就不挂在任何请求上，无法用于排查。要在 trace 里看到它们，在 gRPC server 的拦截器链首加 gordon 的 `stubutils.NewUnaryServerTracingInterceptor()`（quest、learning 已这么做）。探针路径本来就不该有 span，无需处理。
+
+# 1.2.11 (2026-09-08)
+
+- **行为变更：`APM_ENABLE` 与 `OTEL_ENABLE` 同时为 true 时，DB 与 Redis 的插桩两者并存**，OTel 侧从此能看到 `sql.conn.query` 等 DB span 与 Redis span。此前 `entext` 是 `if / else if`，APM 优先直接短路了 otelsql；go-redis v6 的 `redisext` 与 `cachext` redis backend 只 import 了 apmgoredis，零 otel 代码。线上 828 个 Deployment 两个开关同时打开，OTel 里应用 span 一直是没有子 span 的叶子节点。业务服务零代码改动，升级即生效
+- `entext`：双开时把 apmsql 与 otelsql 叠在同一个 driver 上。⚠️ **包装顺序必须是 apmsql 在外、otelsql 在内**——database/sql 只对最外层 conn 做 `driver.Validator` 断言，otelsql 未实现该接口，顺序反了会导致连接健康检查被跳过、事务 ctx 取消后连接被销毁而非归还连接池（实测 30 次「事务 + 查询 + ctx 取消」：正确顺序新建 0~1 条连接，错误顺序 30 条）。已有测试锁定该顺序
+- 新增 `observability/redisotelv6`：给 go-redis v6 补 OTel 追踪，与 apmgoredis 并存，接入 `redisext.Client(ctx)` 与 cachext redis backend 的 `withContext(ctx)` 两处。只在 ctx 有已采样父级时产生 span；`db.statement` 带命令与参数，每个参数截断到 64 字节
+- 不走「迁 go-redis v9」：Elastic APM 没有 v9 模块，迁过去等于用 Redis 的 APM 数据换 OTel 数据
+
+# 1.2.10 (2026-09-03)
+
+- **行为变更：四个 redis 扩展入口（`cachext` 的 v6/v9 backend、`redisext` 的 v6/v9）现在都带连接池与超时默认值**，业务项目无需任何配置即可生效：
+
+  | 参数           | 默认值 | 配置键（v6 / v9）                         | go-redis 原默认值                 |
+  | -------------- | ------ | ----------------------------------------- | --------------------------------- |
+  | 连接池上限     | 100    | `<NS>poolsize`                            | `10 × NumCPU` / `10 × GOMAXPROCS` |
+  | 读超时         | 200ms  | `<NS>readtimeout`                         | 3s                                |
+  | 取连接排队超时 | 100ms  | `<NS>pooltimeout`                         | ReadTimeout + 1s                  |
+  | 空闲回收       | 2m     | `<NS>idletimeout` / `<NS>connmaxidletime` | 5m / 30m                          |
+
+- `PoolSize` 默认值由 1.2.9 的 20 提高到 **100**。20 过于保守，会限制正常流量下的连接需求；100 是按实测单池峰值取的兜底上限
+- **新增三项超时默认值。** go-redis 的原默认值（读 3 秒、排队 4 秒）长于典型在线链路的上游预算，等于把请求堆积留在自己进程里。v6 尤其需要：它的连接读写与排队都不接受 `context`，上游超时管不到 redis 调用，这三项是唯一能限制单连接占用时长的闸。v9 虽然 `deadline` 取 `min(ctx.Deadline(), now+ReadTimeout)`，但 ReadTimeout 作为静态上界仍然必要——没有 deadline 的调用（离线任务、cronjob）否则会落在 3 秒上
+- **空闲回收收敛到 2 分钟。** v9 的 `ConnMaxIdleTime` 默认 30 分钟，一次瞬时并发建出来的连接会被留到半小时后才回收，池子只涨不落
+- 需要放宽的服务显式配置对应键即可覆盖；`<NS>poolsize: 0` 仍然回到 go-redis 自己的默认值
+- `redisext` 补上首批带断言的测试（此前只有无断言的 Example 测试）
+
+- **配置键名现在支持下划线写法**：`redis_poolsize` 与 `redis_pool_size` 都生效。mapstructure 只做大小写折叠、不做下划线归一化，此前后者会被静默忽略；新增的 `gobay.NormalizeUnderscoreKeys` 在 `Unmarshal` 前补齐。两种写法并存时以**不带下划线的**为准——交给 mapstructure 自行处理的话，哪个生效取决于 map 迭代顺序，是不确定的。
+
+⚠️ 时间类参数必须带单位：`200ms` 正确，`200` 会被当成 200 纳秒。
+
+⚠️ `redisext` 的 `<NS>host` 键**不生效**（`redis.Options` 只有 `Addr` 没有 `Host`，mapstructure 找不到字段会静默跳过，go-redis 随后 fallback 到 `localhost:6379`）。本版本未改动这一行为，请显式使用 `<NS>addr`。**`cachext` 不受影响**——它的 redis backend 有 `Addr` 为空时回落到 `<NS>host` 的兼容代码，`cache_host` 照常生效。
+
+# 1.2.9 (2026-09-02)
+
+- `cachext` 的两个 redis backend（v6 / v9）的 `Init` 从硬编码 `host`/`password`/`db` 三个字段改为 `config.Unmarshal`，现在 `redis.Options` 的全部字段都能通过配置设置，与 `redisext` 一致。常用的是 `<NS>poolsize` / `<NS>pooltimeout`
+- **行为变更：`PoolSize` 默认值由 go-redis 的 `10 × NumCPU` 改为 20**。`NumCPU()` 读的是宿主机核数而非容器的 CPU limit，多核节点上的容器会拿到远超实际需要的池上限；这个上限会在 redis 变慢时变成放大器（请求堆积 → 建更多连接 → redis 更慢）。需要更大的池显式配置 `<NS>poolsize: <n>`；**要退回 go-redis 原默认值配 `<NS>poolsize: 0`**，不必回滚版本。未显式配置时启动日志会打印实际生效值与来源
+- v9 backend 在 `GOMAXPROCS < NumCPU`（Go 1.25 的 container-aware GOMAXPROCS 生效，或引入了 automaxprocs）时**不再覆盖** go-redis 的默认值——那种环境下 `10 × GOMAXPROCS` 会随容器规格缩放，比固定值更合理。判断的是运行结果而非 `runtime.Version()`，因为 `containermaxprocs` GODEBUG 的默认值取决于主模块的 go 指令，依赖库读不到。v6 backend 用的是 `runtime.NumCPU()`，不受此影响，始终用固定默认值
+- `<NS>addr` 作为 `<NS>host` 的等价键名（同时配置时 `addr` 优先）；两者都缺失时 `Init` 直接返回错误，而不是让 go-redis 静默 fallback 到 `localhost:6379`
+- cachext 的 backend 初始化错误现在带上 NS 前缀，便于定位是哪个 CacheExt
+
+⚠️ 配置键名**不能带下划线**：`cache_poolsize` 生效，`cache_pool_size` 会被静默忽略（mapstructure 只做大小写折叠，不做下划线归一化）。时间类参数必须带单位，`500ms` 正确，`500` 会被当成 500 纳秒。（下划线写法自 1.2.10 起已支持）
+
 # 1.2.8 (2026-07-27)
 
 - `asynctaskext`/`busext` 新增 Prometheus 处理耗时/QPS 埋点（`asynctask_task_duration_seconds`/`bus_task_duration_seconds`），config `<NS>monitor_enable` 开关可选开启，默认关闭零开销；与 Python coast 库同名同 label 同 buckets，可跨语言合并查询
